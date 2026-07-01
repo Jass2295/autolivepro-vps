@@ -16,10 +16,20 @@ const PORT         = Number(process.env.PORT || 5001);
 const API_KEY      = process.env.API_KEY || "changeme";
 const CONSOLE_PIN  = String(process.env.CONSOLE_PIN || "1234");
 const MAX_STREAMS  = Number(process.env.MAX_STREAMS || 15);
-const CACHE_DIR    = process.env.CACHE_DIR || "/var/alp/cache";
+// Default cache dir lives under the agent's own home directory, not /var —
+// /var is root-owned on most VPS images, so a non-root pm2 user (e.g. "ubuntu")
+// would silently fail to create /var/alp/cache and every cache write would
+// then fail with "curl: (23) Failure writing output to destination".
+const CACHE_DIR    = process.env.CACHE_DIR || path.join(os.homedir(), ".alp-cache");
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_HOURS || 24) * 60 * 60 * 1000;
 
-try { fs.mkdirSync(CACHE_DIR, { recursive: true }); } catch {}
+try {
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  fs.accessSync(CACHE_DIR, fs.constants.W_OK);
+} catch (e) {
+  console.error(`[cache] FATAL: cannot create/write CACHE_DIR "${CACHE_DIR}": ${e.message}`);
+  console.error(`[cache] Set CACHE_DIR env var to a writable path (e.g. ${path.join(os.homedir(), ".alp-cache")}) and restart.`);
+}
 
 app.use(express.json({ limit: "10mb" }));
 

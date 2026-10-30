@@ -14,7 +14,6 @@ const server = http.createServer(app);
 
 const PORT         = Number(process.env.PORT || 5001);
 const API_KEY      = String(process.env.API_KEY || "");
-const CONSOLE_PIN  = String(process.env.CONSOLE_PIN || "");
 const MAX_STREAMS  = Number(process.env.MAX_STREAMS || 15);
 // Default cache dir lives under the agent's own home directory, not /var —
 // /var is root-owned on most VPS images, so a non-root pm2 user (e.g. "ubuntu")
@@ -26,7 +25,6 @@ const ADMIN_SCOPE  = path.resolve(process.env.ADMIN_SCOPE || path.join(os.homedi
 const STATE_FILE   = path.resolve(process.env.STATE_FILE || path.join(os.homedir(), ".autolivepro-streams.json"));
 
 if (API_KEY.length < 32) throw new Error("API_KEY is required and must be at least 32 characters");
-if (CONSOLE_PIN.length < 8) throw new Error("CONSOLE_PIN is required and must be at least 8 characters");
 
 try {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
@@ -655,7 +653,9 @@ function auth(req, res, next) {
   next();
 }
 
-function pinOk(pin) { return pin && safeEqual(String(pin), String(CONSOLE_PIN)); }
+// PIN system removed: every request is already gated by the API key (auth middleware)
+// and by the AutoLive admin login on the data server.
+function pinOk(_pin) { return true; }
 function safePath(p) {
   const raw = String(p || ".");
   const target = path.resolve(path.isAbsolute(raw) ? raw : path.join(ADMIN_SCOPE, raw));

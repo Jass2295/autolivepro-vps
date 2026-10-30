@@ -669,6 +669,7 @@ function safePath(p) {
   );
   const relative = path.relative(ADMIN_SCOPE, resolved);
   if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Path is outside the admin scope");
+  if (resolved.split(path.sep).includes(".ssh")) throw new Error("Access to .ssh is blocked");
   return resolved;
 }
 
@@ -875,29 +876,58 @@ app.post("/terminal/auth", auth, (req, res) => {
 });
 
 app.post("/terminal/run", auth, (req, res) => {
-  const { cmd, pin } = req.body || {};
-  if (!pinOk(pin)) return res.status(401).json({ error: "Invalid PIN" });
+  const { cmd } = req.body || {};
   if (!cmd) return res.status(400).json({ error: "cmd required" });
-  if (/[;&|><`$()]|\.\.(?:\/|\\)/.test(String(cmd))) {
-    return res.status(400).json({ error: "Shell operators and parent-directory paths are not allowed" });
+  // No shell is ever used (execFileSync), and shell metacharacters are rejected
+  // so commands cannot be chained or redirected.
+  if (/[;&|><`$()\\\n\r]/.test(String(cmd))) {
+    return res.status(400).json({ error: "Shell operators (; & | > < ` $ ( ) \\) are not allowed" });
   }
   const parts = String(cmd).trim().split(/\s+/);
-  const allowed = new Set(["pwd", "ls", "find", "du", "df", "cat", "head", "tail", "stat", "mkdir", "touch"]);
-  if (!allowed.has(parts[0])) return res.status(403).json({ error: "Command is not allowed in the scoped terminal" });
-  if (parts.slice(1).some((arg) => arg.startsWith("-"))) {
-    return res.status(400).json({ error: "Command options are disabled in the scoped terminal" });
+  const bin = parts[0];
+  const args = parts.slice(1);
+  const bad = (m) => res.status(400).json({ error: m });
+
+  const FILE_CMDS = new Set(["pwd", "ls", "cat", "head", "tail", "du", "stat", "df", "mkdir", "touch"]);
+  const PM2_SUB = new Set(["list", "ls", "status", "logs", "describe", "restart", "reset", "flush"]);
+  let finalArgs = args;
+
+  if (FILE_CMDS.has(bin)) {
+    if (bin === "tail" && args.some(a => /^(-f|-F|--follow.*)$/.test(a))) return bad("tail -f is not allowed");
+    finalArgs = [];
+    for (let k = 0; k < args.length; k++) {
+      const a = args[k];
+      if (a.startsWith("-")) { finalArgs.push(a); continue; }
+      const prev = args[k - 1] || "";
+      if ((bin === "head" || bin === "tail") && (prev === "-n" || prev === "-c")) { finalArgs.push(a); continue; }
+      try { finalArgs.push(safePath(a)); } catch (e) { return bad(e.message); }
+    }
+  } else if (bin === "pm2") {
+    if (!PM2_SUB.has(args[0])) return bad("pm2 allowed: list, status, logs, describe, restart, reset, flush");
+    finalArgs = args.slice();
+    if (args[0] === "logs" && !args.includes("--nostream")) finalArgs.push("--nostream");
+  } else if (bin === "free" || bin === "top" || bin === "uptime") {
+    if (!args.every(a => /^-[a-zA-Z0-9]+$/.test(a))) return bad(`${bin}: only simple flags are allowed (example: top -bn1)`);
+  } else if (bin === "ps") {
+    if (!args.every(a => /^-?[a-zA-Z]+$/.test(a))) return bad("ps: only simple flags are allowed (example: ps aux)");
+  } else if (bin === "ffmpeg" || bin === "ffprobe") {
+    const ok = args.length > 0 && args.every(a => ["-version", "-hide_banner", "-encoders", "-decoders", "-codecs", "-formats"].includes(a));
+    if (!ok) return bad(`${bin}: only -version / -encoders / -codecs / -formats are allowed`);
+  } else {
+    return res.status(403).json({ error: "Command not allowed. Allowed: pm2, ls, cat, head, tail, du, df, stat, pwd, mkdir, touch, free, top, uptime, ps, ffmpeg -version" });
   }
-  const args = parts.slice(1).map((arg) => {
-    return safePath(arg);
-  });
+
   try {
-    const executable = parts[0] === "pwd" ? "/bin/pwd" : `/usr/bin/${parts[0]}`;
-    const stdout = execFileSync(executable, args, { cwd: ADMIN_SCOPE, timeout: 25000, maxBuffer: 2 * 1024 * 1024 }).toString();
+    const stdout = execFileSync(bin, finalArgs, {
+      cwd: ADMIN_SCOPE, timeout: 25000, maxBuffer: 2 * 1024 * 1024,
+      env: { ...process.env, TERM: "xterm", PM2_NO_COLOR: "true", NO_COLOR: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+    }).toString();
     res.json({ stdout, stderr: "" });
   } catch (e) {
     res.json({
       stdout: e.stdout ? e.stdout.toString() : "",
-      stderr: e.stderr ? e.stderr.toString() : e.message,
+      stderr: e.stderr && e.stderr.length ? e.stderr.toString() : e.message,
     });
   }
 });

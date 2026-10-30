@@ -275,17 +275,69 @@ setInterval(sweepStaleCache, 60 * 60 * 1000); // hourly sweep
 // (now-local) file up front, once, and only pick transcode mode when the
 // codec genuinely isn't H.264.
 function detectVideoCodec(filePath) {
+  return probeVideo(filePath).then(i => i.codec);
+}
+
+// Full probe: codec + pixel format + profile + size + fps + keyframe gap.
+// Copy mode only survives on YouTube/FB if the file is "live friendly", so
+// codec_name === "h264" alone is NOT enough (10-bit / 4:2:2 / huge GOP /
+// 4K / VFR phone videos are all h264 but break or stutter in copy mode).
+function probeVideo(filePath) {
   return new Promise((resolve) => {
     execFile("ffprobe", [
       "-v", "quiet", "-select_streams", "v:0",
-      "-show_entries", "stream=codec_name",
-      "-of", "default=noprint_wrappers=1:nokey=1",
-      filePath,
-    ], { timeout: 10000 }, (err, stdout) => {
-      if (err) return resolve("unknown");
-      resolve((stdout || "").toString().trim() || "unknown");
+      "-show_entries", "stream=codec_name,profile,pix_fmt,width,height,avg_frame_rate,r_frame_rate",
+      "-of", "json", filePath,
+    ], { timeout: 15000 }, (err, stdout) => {
+      if (err) return resolve({ codec: "unknown" });
+      let st = {};
+      try { st = (JSON.parse(stdout).streams || [])[0] || {}; } catch {}
+      const info = {
+        codec: (st.codec_name || "unknown").toLowerCase(),
+        profile: st.profile || "", pix_fmt: st.pix_fmt || "",
+        width: Number(st.width) || 0, height: Number(st.height) || 0,
+        fps: evalFps(st.avg_frame_rate) || evalFps(st.r_frame_rate) || 0,
+        vfr: !!(st.avg_frame_rate && st.r_frame_rate && st.avg_frame_rate !== st.r_frame_rate),
+        maxGop: 0,
+      };
+      // keyframe gap over the first 90s (cheap: packet headers only)
+      execFile("ffprobe", [
+        "-v", "quiet", "-select_streams", "v:0", "-read_intervals", "%90",
+        "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", filePath,
+      ], { timeout: 30000, maxBuffer: 64 * 1024 * 1024 }, (e2, out) => {
+        if (!e2 && out) {
+          let last = null, max = 0;
+          for (const l of out.toString().split("\n")) {
+            const [t, f] = l.split(",");
+            if (f && f.includes("K") && t && t !== "N/A") {
+              const ts = parseFloat(t);
+              if (last !== null && ts - last > max) max = ts - last;
+              last = ts;
+            }
+          }
+          info.maxGop = max;
+        }
+        resolve(info);
+      });
     });
   });
+}
+function evalFps(v) {
+  if (!v || v === "0/0") return 0;
+  const [a, b] = String(v).split("/").map(Number);
+  return b ? a / b : a || 0;
+}
+// true => file must be normalized at upload time so live copy-mode is safe
+function needsNormalize(i) {
+  if (i.codec === "unknown") return false;           // can't tell; don't burn CPU
+  if (i.codec !== "h264") return true;
+  if (i.pix_fmt && i.pix_fmt !== "yuv420p") return true;           // 10-bit / 4:2:2 / 4:4:4
+  if (/High 10|High 4:2:2|High 4:4:4|Hi10|Hi422|Hi444/i.test(i.profile)) return true;
+  if (i.height > 1080 || i.width > 1920) return true;
+  if (i.fps > 60.5) return true;
+  if (i.vfr) return true;                            // variable fps => audio/video drift in copy
+  if (i.maxGop > 4.5) return true;                   // YouTube wants a keyframe at least every 4s
+  return false;
 }
 
 // ─── Smart FFmpeg args ────────────────────────────────────────────────────────
@@ -342,6 +394,7 @@ function buildFfmpegArgs(cfg, videoInputs, useTranscode, threadCap) {
   } else {
     // Smart copy — copy video codec (0% CPU if H.264), always AAC audio (~1% CPU)
     args.push(
+      "-fflags", "+genpts",
       "-c:v", "copy",
       "-c:a", "aac",
       "-b:a", "128k",
@@ -384,7 +437,7 @@ async function startFfmpeg(slotId, cfg, restartCount = 0, opts = {}) {
   // Decide mode: prefer the ffprobe-confirmed codec on the first attempt;
   // only escalate to transcode automatically once copy mode has genuinely
   // failed (handled in the exit handler below).
-  let useTranscode = opts.forceTranscode === true || restartCount >= 2;
+  let useTranscode = opts.forceTranscode === true;
   if (restartCount === 0 && !useTranscode) {
     const codec = await detectVideoCodec(videoInputs[0]);
     if (codec !== "h264" && codec !== "unknown") {
@@ -423,9 +476,12 @@ async function startFfmpeg(slotId, cfg, restartCount = 0, opts = {}) {
   const mode = useTranscode ? "TRANSCODE" : "COPY+AAC";
   console.log(`[${slotId}] ffmpeg started — mode: ${mode}, attempt: ${restartCount + 1}, threads: ${threadCap}`);
 
+  let errTail = "";
+  const runStart = Date.now();
   // Log ALL stderr — helps debug YouTube rejections
   proc.stderr.on("data", chunk => {
     const line = chunk.toString();
+    errTail = (errTail + line).slice(-1500);
     if (
       line.toLowerCase().includes("error") ||
       line.toLowerCase().includes("failed") ||
@@ -441,36 +497,43 @@ async function startFfmpeg(slotId, cfg, restartCount = 0, opts = {}) {
 
   proc.on("exit", (code, signal) => {
     const manual = entry?.status === "stopped";
-    if (!manual) {
-      // First failure in copy mode → switch to transcode automatically.
-      // (Still only one automatic escalation — repeated non-zero exits after
-      // that are treated as transient and just retried in the SAME mode with
-      // backoff, instead of being assumed to be a codec problem.)
-      if (code !== 0 && restartCount === 0 && !useTranscode) {
-        console.log(`[${slotId}] copy mode failed (code ${code}), retrying with full transcode...`);
-        if (streams.get(slotId) === entry) streams.get(slotId).status = "restarting";
-        persistStreams();
-        setTimeout(() => {
-          if (streams.get(slotId) === entry && streams.get(slotId).status === "restarting")
-            startFfmpeg(slotId, cfg, 1, { forceTranscode: true });
-        }, 3000);
-      } else if (code !== 0 && restartCount < 10) {
-        const delay = Math.min(5000 * Math.pow(1.5, restartCount - 1), 60000);
-        console.log(`[${slotId}] restarting in ${Math.round(delay/1000)}s (attempt ${restartCount + 1})`);
-        if (streams.get(slotId) === entry) streams.get(slotId).status = "restarting";
-        persistStreams();
-        setTimeout(() => {
-          if (streams.get(slotId) === entry && streams.get(slotId).status === "restarting")
-            startFfmpeg(slotId, cfg, restartCount + 1, { forceTranscode: useTranscode });
-        }, delay);
-      } else {
-        cleanupEntry(slotId);
-        notifyUrl(cfg.callback_url, cfg.vps_key, {
-          slot_id: slotId, reason: code === 0 ? "ffmpeg_exit" : "unexpected_exit",
-        });
-      }
+    if (manual) { cleanupEntry(slotId); return; }
+
+    const ranMs = Date.now() - runStart;
+    // A run that stayed up >2 min was healthy: forget old failures, so one
+    // network blip a day never adds up to a permanent transcode.
+    const effRestart = ranMs > 120000 ? 0 : restartCount;
+
+    // Only a REAL media/codec problem justifies switching to transcode.
+    // RTMP drops, broken pipe, connection reset, DNS etc. just retry in COPY.
+    const codecProblem = /Invalid data found|Unsupported|not supported|Could not write header|codec.*(not|unknown)|Error initializing|Error while opening|unspecified pixel format|incorrect codec parameters|moov atom not found|no decoder/i.test(errTail);
+    const netProblem = /Broken pipe|Connection (reset|refused|timed out)|Input\/output error|Server returned|Error writing trailer|Cannot open connection|Immediate exit requested/i.test(errTail);
+
+    console.log(`[${slotId}] ffmpeg exited code=${code} ran=${Math.round(ranMs/1000)}s codecProblem=${codecProblem} netProblem=${netProblem}\n  last stderr: ${errTail.trim().split("\n").slice(-3).join(" | ")}`);
+
+    if (code !== 0 && !useTranscode && codecProblem && !netProblem && ranMs < 120000) {
+      console.log(`[${slotId}] copy failed because of codec/format — one-off transcode retry`);
+      if (streams.get(slotId) === entry) streams.get(slotId).status = "restarting";
+      persistStreams();
+      setTimeout(() => {
+        if (streams.get(slotId) === entry && streams.get(slotId).status === "restarting")
+          startFfmpeg(slotId, cfg, 1, { forceTranscode: true });
+      }, 3000);
+    } else if ((code !== 0 || (cfg.loop && ranMs > 5000)) && effRestart < 10) {
+      // stay in the SAME mode, always try copy again after a transient failure
+      const delay = Math.min(3000 * Math.pow(1.5, effRestart), 60000);
+      console.log(`[${slotId}] restarting in ${Math.round(delay/1000)}s in ${useTranscode ? "TRANSCODE" : "COPY"} mode (attempt ${effRestart + 2})`);
+      if (streams.get(slotId) === entry) streams.get(slotId).status = "restarting";
+      persistStreams();
+      setTimeout(() => {
+        if (streams.get(slotId) === entry && streams.get(slotId).status === "restarting")
+          startFfmpeg(slotId, cfg, effRestart + 1, { forceTranscode: useTranscode });
+      }, delay);
     } else {
       cleanupEntry(slotId);
+      notifyUrl(cfg.callback_url, cfg.vps_key, {
+        slot_id: slotId, reason: code === 0 ? "ffmpeg_exit" : "unexpected_exit",
+      });
     }
   });
 }
@@ -523,10 +586,11 @@ async function processVideo(videoId, sourceUrl, callbackUrl, vpsKey, job) {
   }
   if (job.cancelled) return;
 
-  const codec = await detectVideoCodec(localPath);
+  const info = await probeVideo(localPath);
+  const codec = info.codec;
   if (job.cancelled) return;
-  if (codec === "h264") {
-    console.log(`[process] ${videoId} already h264 — cached, no transcode needed`);
+  if (!needsNormalize(info)) {
+    console.log(`[process] ${videoId} live-friendly (${codec} ${info.pix_fmt} ${info.width}x${info.height} @${info.fps.toFixed(1)} gop<=${info.maxGop.toFixed(1)}s) — copy mode OK`);
     if (job.cancelled) return;
     return notifyUrl(callbackUrl, vpsKey, { video_id: videoId, ok: true, codec, transcoded: false });
   }
@@ -538,13 +602,18 @@ async function processVideo(videoId, sourceUrl, callbackUrl, vpsKey, job) {
   const threads = busy ? 1 : Math.max(1, os.cpus().length - 1);
   const outPath = `${localPath}.tmp.mp4`;
 
-  console.log(`[process] ${videoId} codec=${codec} → transcoding to h264 (${busy ? "background/idle priority" : "normal priority"}, threads=${threads})`);
+  console.log(`[process] ${videoId} NOT live-friendly (${codec} ${info.pix_fmt} ${info.width}x${info.height} @${info.fps.toFixed(1)} gop<=${info.maxGop.toFixed(1)}s) → normalizing to h264 (${busy ? "background/idle priority" : "normal priority"}, threads=${threads})`);
 
   try {
     await new Promise((resolve, reject) => {
       const proc = spawnPrioritized("ffmpeg", [
         "-i", localPath,
+        "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30",
         "-c:v", "libx264", "-preset", busy ? "ultrafast" : "veryfast",
+        "-pix_fmt", "yuv420p", "-profile:v", "high",
+        "-r", "30", "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
+        "-force_key_frames", "expr:gte(t,n_forced*2)",
+        "-crf", "23", "-maxrate", "6000k", "-bufsize", "12000k",
         "-threads", String(threads),
         "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
         "-movflags", "+faststart",
